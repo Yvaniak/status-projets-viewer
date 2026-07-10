@@ -5,7 +5,7 @@ use std::{
     process::{exit, Command},
 };
 
-use git2::{Repository, StatusOptions};
+use git2::{Branch, BranchType, Repository, StatusOptions};
 
 fn flakechecker(p: Projet) -> bool {
     let lock_location = &(p.location + "/flake.lock");
@@ -49,85 +49,144 @@ fn flakechecker(p: Projet) -> bool {
 fn gitstatus(repo: &Repository) -> bool {
     let mut status_options = StatusOptions::new();
     status_options.include_ignored(false);
-    let res_statuses = repo.statuses(Some(&mut status_options));
-    match res_statuses {
+    match repo.statuses(Some(&mut status_options)) {
         Ok(statuses) => {
-            if statuses.is_empty() {
+            let clean = statuses.is_empty();
+            if clean {
                 println!("{}", "  very clean : true".green());
-                true
             } else {
                 println!("{}", "  very clean : false".red());
-                false
-            };
-            statuses.is_empty()
+            }
+            clean
         }
         Err(e) => {
             println!("{} {}", "  statuses error :".yellow(), e);
-
             false
         }
     }
 }
 
-fn gitbranchdiff(repo: Repository) -> bool {
-    let res_branches = repo.branches(None);
-    match res_branches {
-        Ok(branches) => {
-            let mut result = false;
-            for res_branch in branches {
-                match res_branch {
-                    Ok(branch) => {
-                        if branch.0.is_head() {
-                            let upstream = branch.0.upstream().expect("error opening upstream");
-                            let upstream_tree = upstream
-                                .get()
-                                .peel_to_tree()
-                                .expect("error opening upstream tree");
-                            let res_diff =
-                                repo.diff_tree_to_workdir_with_index(Some(&upstream_tree), None);
-                            match res_diff {
-                                Ok(diff) => {
-                                    let diffstats = diff.stats().expect("error opening difftstats");
-                                    if diffstats.files_changed() == 0
-                                        && diffstats.insertions() == 0
-                                        && diffstats.deletions() == 0
-                                    {
-                                        println!("{}", "  diff with remote : none".green());
-                                        result = true;
-                                    } else {
-                                        println!("{}", "  diff with remote : diffs".red());
-                                    }
-                                }
-                                Err(e) => {
-                                    println!("{} {}", "error in diff :".yellow(), e)
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("{} {}", "  branch error :".yellow(), e);
-                    }
+fn diff_against(repo: &Repository, reference: &Branch, label: &str) -> bool {
+    let tree = match reference.get().peel_to_tree() {
+        Ok(t) => t,
+        Err(e) => {
+            println!("{} {}", "error opening reference tree:".yellow(), e);
+            return false;
+        }
+    };
+
+    let diff = match repo.diff_tree_to_workdir_with_index(Some(&tree), None) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("{} {}", "error in diff:".yellow(), e);
+            return false;
+        }
+    };
+
+    let stats = match diff.stats() {
+        Ok(s) => s,
+        Err(e) => {
+            println!("{} {}", "error opening diffstats:".yellow(), e);
+            return false;
+        }
+    };
+
+    let clean = stats.files_changed() == 0 && stats.insertions() == 0 && stats.deletions() == 0;
+    if clean {
+        println!("{}", format!("{} : none", label).green());
+    } else {
+        println!("{}", format!("{} : diffs", label).red());
+    }
+    clean
+}
+
+fn default_branch_name(repo: &Repository) -> String {
+    if let Ok(config) = repo.config() {
+        if let Ok(value) = config.get_str("init.defaultBranch") {
+            if !value.is_empty() {
+                return value.to_owned();
+            }
+        }
+    }
+    if let Ok(branch) = repo.find_branch("origin/HEAD", BranchType::Remote) {
+        if let Some(name) = branch.name().ok().flatten() {
+            if let Some(local) = name.strip_prefix("origin/") {
+                if !local.is_empty() {
+                    return local.to_owned();
                 }
             }
-            result
-        }
-        Err(e) => {
-            println!("{} {}", "  branches error :".yellow(), e);
-            false
         }
     }
+    "main".to_owned()
 }
 
-fn git(p: Projet) -> bool {
+fn gitbranchdiff(repo: &Repository) -> bool {
+    let branches = match repo.branches(None) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("{} {}", "  branches error :".yellow(), e);
+            return false;
+        }
+    };
+
+    for res in branches.flatten() {
+        if !res.0.is_head() {
+            continue;
+        }
+        return match res.0.upstream() {
+            Ok(upstream) => diff_against(repo, &upstream, "  diff with remote"),
+            Err(_) => {
+                println!("{}", "  no upstream branch configured".yellow());
+                false
+            }
+        };
+    }
+
+    let default = default_branch_name(repo);
+
+    if let Ok(branch) = repo.find_branch(&default, BranchType::Local) {
+        if let Ok(upstream) = branch.upstream() {
+            println!(
+                "{}",
+                format!("  detached HEAD, using upstream of '{}'", default).yellow()
+            );
+            return diff_against(
+                repo,
+                &upstream,
+                &format!("  diff with remote ({})", default),
+            );
+        }
+    }
+
+    let remote_name = format!("origin/{}", default);
+    if let Ok(remote) = repo.find_branch(&remote_name, BranchType::Remote) {
+        println!(
+            "{}",
+            format!("  detached HEAD, using {}", remote_name).yellow()
+        );
+        return diff_against(repo, &remote, &format!("  diff with remote ({})", default));
+    }
+
+    println!(
+        "{}",
+        format!("  detached HEAD, no reference found for '{}'", default).yellow()
+    );
+    false
+}
+
+fn git(p: &Projet) -> bool {
     if !p.git {
         return true;
     }
-    let repo = match Repository::open(p.location) {
+    let repo = match Repository::open(p.location.clone()) {
         Ok(repo) => repo,
-        Err(e) => panic!("{} {}", "failed to open git repo:".yellow(), e),
+        Err(e) => {
+            println!("{} : {}", "  failed to open git repo".yellow(), e);
+            return false;
+        }
     };
 
-    gitstatus(&repo) && gitbranchdiff(repo)
+    gitstatus(&repo) && gitbranchdiff(&repo)
 }
 
 #[derive(Deserialize)]
@@ -222,7 +281,7 @@ fn main() {
             println!("{}", projet.name);
             let res: Resultat = Resultat {
                 flakechecker: flakechecker(projet.clone()),
-                git: git(projet),
+                git: git(&projet),
             };
             if res.all() {
                 println!("{}", "all".green());
