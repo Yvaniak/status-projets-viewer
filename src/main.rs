@@ -221,14 +221,14 @@ fn get_config() -> Config {
     if !fs::exists(&config_dir).expect("io exists didn't work") {
         eprintln!(
             "Could not find config directory at `{}`, you need to create it with a config.toml",
-            &config_dir
+            config_dir
         );
         exit(1);
     }
     if !fs::exists(&config_path).expect("io exists didn't work") {
         eprintln!(
             "Could not find config file at `{}`, you need to create a config.toml",
-            &config_path
+            config_path
         );
         exit(1);
     }
@@ -238,7 +238,7 @@ fn get_config() -> Config {
         Err(e) => {
             eprintln!(
                 "Could not read config file at `{}` for : {}",
-                &config_path, e
+                config_path, e
             );
             exit(1);
         }
